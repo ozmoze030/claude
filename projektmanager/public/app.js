@@ -11,7 +11,7 @@ async function api(method, url, body) {
   let data = {};
   try { data = await res.json(); } catch { /* empty body */ }
   if (!res.ok) {
-    if (res.status === 401 && !url.startsWith('/api/login')) { state.me = null; render(); }
+    if (res.status === 401 && !url.startsWith('/api/login')) { state.me = null; disconnectEvents(); render(); }
     if (data.code === 'MUST_CHANGE_PASSWORD') { state.me.mustChangePassword = true; render(); }
     const err = new Error(data.error || 'Unbekannter Fehler.');
     err.status = res.status;
@@ -107,6 +107,14 @@ const state = {
   navOpen: false,
   filterAssignee: 'all',
   showCompleted: true,
+  allTasks: null,      // tasks of all accessible projects (calendar, workload)
+  counts: { inbox: 0, chat: 0 },
+  notifications: null,
+  chat: { channels: [], messages: [] },
+  calMonth: todayStr().slice(0, 7),
+  calMine: false,
+  resOffset: 0,
+  resSel: null,
 };
 
 function parseHash() {
@@ -116,7 +124,11 @@ function parseHash() {
   if (tm) { hash = tm[1]; taskId = Number(tm[2]); }
   let route;
   let m;
-  if ((m = hash.match(/^\/project\/(\d+)(?:\/(board|list))?$/))) route = { name: 'project', id: Number(m[1]), view: m[2] || 'board' };
+  if ((m = hash.match(/^\/project\/(\d+)(?:\/(board|list|calendar))?$/))) route = { name: 'project', id: Number(m[1]), view: m[2] || 'board' };
+  else if ((m = hash.match(/^\/chat(?:\/(general|project:\d+|dm:\d+))?$/))) route = { name: 'chat', key: m[1] || (innerWidth > 800 ? 'general' : null) };
+  else if (hash === '/inbox') route = { name: 'inbox' };
+  else if (hash === '/calendar') route = { name: 'calendar' };
+  else if (hash === '/resources') route = { name: 'resources' };
   else if (hash === '/projects') route = { name: 'projects' };
   else if (hash === '/team') route = { name: 'team' };
   else if (hash === '/settings') route = { name: 'settings' };
@@ -155,6 +167,18 @@ async function loadRouteData() {
       state.myTasks = (await api('GET', '/api/my-tasks')).tasks;
     } else if (state.route.name === 'team') {
       state.allUsers = (await api('GET', '/api/users?all=1')).users;
+    } else if (state.route.name === 'calendar' || state.route.name === 'resources') {
+      state.resSel = null;
+      const [tasks] = await Promise.all([api('GET', '/api/all-tasks'), refreshUsers()]);
+      state.allTasks = tasks.tasks;
+    } else if (state.route.name === 'inbox') {
+      state.notifications = (await api('GET', '/api/notifications')).notifications;
+    } else if (state.route.name === 'chat') {
+      const key = state.route.key;
+      // Loading the messages marks the channel as read, so fetch them before the channel list.
+      state.chat.messages = key ? (await api('GET', `/api/chat/messages?channel=${encodeURIComponent(key)}`)).messages : [];
+      state.chat.channels = (await api('GET', '/api/chat/channels')).channels;
+      refreshCounts();
     }
   } catch (e) {
     if (e.status === 404) { toast(e.message, true); go('/my-tasks'); } else showError(e);
@@ -240,6 +264,7 @@ async function afterLogin(user) {
   state.baseHash = '';
   if (!user.mustChangePassword) {
     await Promise.all([refreshUsers(), refreshProjects()]);
+    connectEvents();
     await onRoute();
   } else {
     render();
@@ -248,20 +273,31 @@ async function afterLogin(user) {
 
 async function logout() {
   await api('POST', '/api/logout').catch(() => {});
+  disconnectEvents();
   state.me = null;
   state.project = null;
+  state.allTasks = null;
+  state.notifications = null;
+  state.chat = { channels: [], messages: [] };
+  state.counts = { inbox: 0, chat: 0 };
   state.baseHash = '';
+  document.title = 'Projektmanager';
   render();
 }
 
 // ---------------------------------------------------------------- sidebar
 function sidebar() {
   const r = state.route;
-  const navLink = (hash, icon, label, active) => h('a', { class: `nav-item ${active ? 'active' : ''}`, href: `#${hash}` },
-    h('span', {}, icon), h('span', { class: 'label' }, label));
+  const navLink = (hash, icon, label, active, badge) => h('a', { class: `nav-item ${active ? 'active' : ''}`, href: `#${hash}` },
+    h('span', {}, icon), h('span', { class: 'label' }, label),
+    badge && h('span', { class: 'badge-count', id: `badge-${badge}`, hidden: !state.counts[badge] }, state.counts[badge] || ''));
   return h('aside', { class: 'sidebar' },
     h('div', { class: 'brand' }, h('span', { class: 'logo' }, '✓'), 'Projektmanager'),
     navLink('/my-tasks', '☑', 'Meine Aufgaben', r.name === 'my-tasks'),
+    navLink('/inbox', '🔔', 'Inbox', r.name === 'inbox', 'inbox'),
+    navLink('/chat', '💬', 'Chat', r.name === 'chat', 'chat'),
+    navLink('/calendar', '📅', 'Kalender', r.name === 'calendar'),
+    navLink('/resources', '📊', 'Auslastung', r.name === 'resources'),
     navLink('/projects', '▦', 'Alle Projekte', r.name === 'projects'),
     state.me.role === 'admin' && navLink('/team', '👥', 'Team verwalten', r.name === 'team'),
     h('div', { class: 'nav-section' }, 'Projekte',
@@ -291,6 +327,10 @@ function mainView() {
   else if (r.name === 'projects') view = projectsView();
   else if (r.name === 'team') view = teamView();
   else if (r.name === 'settings') view = settingsView();
+  else if (r.name === 'inbox') view = inboxView();
+  else if (r.name === 'chat') view = chatView();
+  else if (r.name === 'calendar') view = globalCalendarView();
+  else if (r.name === 'resources') view = resourcesView();
   else view = myTasksView();
   return h('main', { class: 'main', onclick: () => { if (state.navOpen) { state.navOpen = false; render(); } } }, view);
 }
@@ -358,7 +398,8 @@ function projectView() {
       h('h1', {}, h('span', { class: 'dot', style: { background: project.color, width: '14px', height: '14px' } }), project.name),
       h('div', { class: 'tabs' },
         h('a', { href: `${base}/board`, class: r.view === 'board' ? 'active' : '' }, 'Board'),
-        h('a', { href: `${base}/list`, class: r.view === 'list' ? 'active' : '' }, 'Liste')),
+        h('a', { href: `${base}/list`, class: r.view === 'list' ? 'active' : '' }, 'Liste'),
+        h('a', { href: `${base}/calendar`, class: r.view === 'calendar' ? 'active' : '' }, 'Kalender')),
       h('div', { class: 'spacer' }),
       h('div', { class: 'filter-bar' },
         h('select', {
@@ -370,9 +411,10 @@ function projectView() {
         h('option', { value: 'none', selected: state.filterAssignee === 'none' }, 'Nicht zugewiesen'),
         members.filter((m) => m.id !== state.me.id).map((m) => h('option', { value: String(m.id), selected: state.filterAssignee === String(m.id) }, m.name)))),
       h('div', { class: 'avatars', title: 'Projektmitglieder' }, members.slice(0, 5).map((m) => avatar(m))),
+      h('button', { class: 'btn', title: 'Eigene Felder für Aufgaben in diesem Projekt', onclick: () => fieldsDialog(data) }, '＋ Felder'),
       h('button', { class: 'btn', onclick: () => projectDialog(data) }, '⚙ Einstellungen'),
     ),
-    h('div', { class: 'content' }, r.view === 'list' ? listView(data) : boardView(data)),
+    h('div', { class: 'content' }, r.view === 'list' ? listView(data) : r.view === 'calendar' ? calendarView(filteredTasks(data.tasks), data) : boardView(data)),
   ];
 }
 
@@ -396,6 +438,10 @@ function applyTaskUpdate(updated) {
   if (state.project) {
     const i = state.project.tasks.findIndex((t) => t.id === updated.id);
     if (i >= 0) state.project.tasks[i] = updated;
+  }
+  if (state.allTasks) {
+    const i = state.allTasks.findIndex((t) => t.id === updated.id);
+    if (i >= 0) state.allTasks[i] = updated;
   }
   if (state.myTasks) {
     const i = state.myTasks.findIndex((t) => t.id === updated.id);
@@ -516,6 +562,8 @@ function card(task) {
   h('div', { class: 'card-top' }, checkButton(task), h('div', { class: 'card-title' }, task.title)),
   h('div', { class: 'card-meta' },
     prioBadge(task.priority), dueInfo(task.dueDate, task.completed),
+    task.subtaskCount ? h('span', { title: 'Unteraufgaben' }, `☑ ${task.subtaskDone}/${task.subtaskCount}`) : null,
+    task.attachmentCount ? h('span', { title: 'Dateianhänge' }, `📎 ${task.attachmentCount}`) : null,
     task.commentCount ? h('span', { title: 'Kommentare' }, `💬 ${task.commentCount}`) : null,
     h('span', { class: 'spacer' }), assignee ? avatar(assignee) : null));
   return el;
@@ -565,21 +613,24 @@ function listView(data) {
   const newBtn = h('button', { class: 'btn primary', style: { marginLeft: '12px' }, onclick: () => newTaskDialog(data) }, '+ Aufgabe');
   return h('div', {},
     h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } }, toggle, newBtn),
-    taskTable(tasks, { groupBy: data.sections }));
+    h('div', { class: 'res-scroll' }, taskTable(tasks, { groupBy: data.sections, fields: data.fields })));
 }
 
-function taskTable(tasks, { showProject = false, groupBy = null } = {}) {
+function taskTable(tasks, { showProject = false, groupBy = null, fields = [] } = {}) {
   const row = (t) => {
     const assignee = t.assigneeId ? userById(t.assigneeId) || { id: t.assigneeId, name: t.assigneeName } : null;
     return h('tr', { class: `task-row ${t.completed ? 'done' : ''}`, onclick: () => openTask(t.id) },
       h('td', {}, h('div', { class: 'title-cell' }, checkButton(t), h('span', { class: 'title' }, t.title),
+        t.subtaskCount ? h('span', { class: 'hint', style: { margin: 0 } }, `☑ ${t.subtaskDone}/${t.subtaskCount}`) : null,
+        t.attachmentCount ? h('span', { class: 'hint', style: { margin: 0 } }, `📎 ${t.attachmentCount}`) : null,
         t.commentCount ? h('span', { class: 'hint', style: { margin: 0 } }, `💬 ${t.commentCount}`) : null)),
       showProject && h('td', { class: 'hide-sm' }, h('span', { class: 'project-pill' }, h('span', { class: 'dot', style: { background: t.projectColor } }), t.projectName)),
       h('td', { class: 'hide-sm' }, assignee ? h('div', { class: 'assignee-cell' }, avatar(assignee), assignee.name) : h('span', { class: 'hint' }, '–')),
       h('td', {}, dueInfo(t.dueDate, t.completed) || h('span', { class: 'hint' }, '–')),
-      h('td', { class: 'hide-sm' }, prioBadge(t.priority)));
+      h('td', { class: 'hide-sm' }, prioBadge(t.priority)),
+      fields.map((f) => h('td', { class: 'hide-sm' }, fieldDisplay(f, t.fields?.[f.id]))));
   };
-  const cols = 3 + (showProject ? 1 : 0) + 1;
+  const cols = 3 + (showProject ? 1 : 0) + 1 + fields.length;
   let bodyRows;
   if (groupBy) {
     bodyRows = groupBy.map((s) => {
@@ -591,7 +642,8 @@ function taskTable(tasks, { showProject = false, groupBy = null } = {}) {
   }
   return h('table', { class: 'list-table' },
     h('thead', {}, h('tr', {}, h('th', {}, 'Aufgabe'), showProject && h('th', { class: 'hide-sm' }, 'Projekt'),
-      h('th', { class: 'hide-sm' }, 'Zuständig'), h('th', {}, 'Fällig'), h('th', { class: 'hide-sm' }, 'Priorität'))),
+      h('th', { class: 'hide-sm' }, 'Zuständig'), h('th', {}, 'Fällig'), h('th', { class: 'hide-sm' }, 'Priorität'),
+      fields.map((f) => h('th', { class: 'hide-sm' }, f.name)))),
     h('tbody', {}, bodyRows));
 }
 
@@ -626,7 +678,7 @@ async function taskMembers(projectId) {
   return [...members, ...state.users.filter((u) => u.role === 'admin' && !ids.has(u.id))];
 }
 
-function taskPanel({ task, comments }, members) {
+function taskPanel({ task, comments, subtasks, attachments, fields }, members) {
   const save = async (patch) => {
     try {
       const { task: updated } = await api('PATCH', `/api/tasks/${task.id}`, patch);
@@ -669,6 +721,77 @@ function taskPanel({ task, comments }, members) {
   commentInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendComment(); });
 
   const creator = userById(task.createdBy);
+  const adopt = (updated) => { Object.assign(task, updated); applyTaskUpdate(updated); };
+
+  // custom fields
+  const saveField = async (f, value) => {
+    try { adopt((await api('PUT', `/api/tasks/${task.id}/fields/${f.id}`, { value })).task); } catch (e) { showError(e); }
+  };
+  const fieldInput = (f) => {
+    const v = task.fields?.[f.id];
+    if (f.type === 'checkbox') return h('input', { type: 'checkbox', checked: v === '1', style: { width: 'auto', justifySelf: 'start' }, onchange: (e) => saveField(f, e.target.checked) });
+    if (f.type === 'select') {
+      return h('select', { onchange: (e) => saveField(f, e.target.value) }, h('option', { value: '' }, '–'),
+        f.options.map((o) => h('option', { value: o, selected: o === v }, o)));
+    }
+    return h('input', { type: f.type, step: f.type === 'number' ? 'any' : null, value: v ?? '', onchange: (e) => saveField(f, e.target.value) });
+  };
+
+  // subtasks
+  const subHead = h('h3', {});
+  const subWrap = h('div', { class: 'subtasks' });
+  const subReq = async (method, url, body) => {
+    try { const r = await api(method, url, body); drawSubs(r.subtasks); adopt(r.task); } catch (e) { showError(e); }
+  };
+  function drawSubs(list) {
+    subHead.textContent = list.length ? `Unteraufgaben (${list.filter((s) => s.completed).length}/${list.length})` : 'Unteraufgaben';
+    subWrap.replaceChildren(...list.map((s) => h('div', { class: `subtask ${s.completed ? 'done' : ''}` },
+      h('button', { class: `check ${s.completed ? 'on' : ''}`, title: 'Erledigt', onclick: () => subReq('PATCH', `/api/subtasks/${s.id}`, { completed: !s.completed }) }, '✓'),
+      h('input', { type: 'text', class: 'subtask-title', value: s.title, maxlength: 300, onchange: (e) => subReq('PATCH', `/api/subtasks/${s.id}`, { title: e.target.value }) }),
+      h('button', { class: 'icon-btn', title: 'Unteraufgabe löschen', onclick: () => subReq('DELETE', `/api/subtasks/${s.id}`) }, '✕'))));
+  }
+  drawSubs(subtasks);
+  const subInput = h('input', {
+    type: 'text', placeholder: '+ Unteraufgabe hinzufügen (Enter)', maxlength: 300,
+    onkeydown: (e) => {
+      if (e.key !== 'Enter' || !subInput.value.trim()) return;
+      const title = subInput.value.trim();
+      subInput.value = '';
+      subReq('POST', `/api/tasks/${task.id}/subtasks`, { title });
+    },
+  });
+
+  // attachments
+  const attWrap = h('div', { class: 'attachments' });
+  function drawAtts(list) {
+    attWrap.replaceChildren(...list.map((a) => h('div', { class: 'attachment' },
+      a.isImage
+        ? h('a', { href: `/api/attachments/${a.id}?inline=1`, target: '_blank', rel: 'noopener' }, h('img', { src: `/api/attachments/${a.id}?inline=1`, alt: '', loading: 'lazy' }))
+        : h('span', { class: 'file-icon' }, '📄'),
+      h('div', { class: 'att-info' }, h('a', { href: `/api/attachments/${a.id}`, download: a.filename }, a.filename),
+        h('div', { class: 'hint' }, `${fmtSize(a.size)} · ${a.userName || 'Unbekannt'} · ${formatDateTime(a.createdAt)}`)),
+      (a.userId === state.me.id || state.me.role === 'admin') && h('button', {
+        class: 'icon-btn', title: 'Datei löschen',
+        onclick: async () => {
+          if (!confirm(`Datei „${a.filename}“ löschen?`)) return;
+          try { const r = await api('DELETE', `/api/attachments/${a.id}`); drawAtts(r.attachments); adopt(r.task); } catch (e) { showError(e); }
+        },
+      }, '✕'))));
+  }
+  drawAtts(attachments);
+  const uploadBtn = h('button', { class: 'btn small', onclick: () => fileInput.click() }, '📎 Datei anhängen');
+  const uploadFiles = async (files) => {
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = 'Lädt hoch…';
+    for (const f of files) {
+      if (f.size > 25 * 1024 * 1024) { toast(`„${f.name}“ ist größer als 25 MB.`, true); continue; }
+      try { const r = await uploadFile(task.id, f); drawAtts(r.attachments); adopt(r.task); } catch (e) { showError(e); }
+    }
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = '📎 Datei anhängen';
+  };
+  const fileInput = h('input', { type: 'file', multiple: true, hidden: true, onchange: async () => { await uploadFiles([...fileInput.files]); fileInput.value = ''; } });
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
 
   return h('aside', { class: 'panel', role: 'dialog', 'aria-label': 'Aufgabendetails' },
     h('div', { class: 'panel-head' }, completeBtn, h('span', { class: 'spacer' }),
@@ -692,7 +815,12 @@ function taskPanel({ task, comments }, members) {
         },
       }, '🗑'),
       h('button', { class: 'icon-btn', title: 'Schließen', onclick: closeTask }, '✕')),
-    h('div', { class: 'panel-body' },
+    h('div', {
+      class: 'panel-body',
+      ondragover: (e) => { if (hasFiles(e)) { e.preventDefault(); e.currentTarget.classList.add('file-over'); } },
+      ondragleave: (e) => { if (!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.classList.remove('file-over'); },
+      ondrop: (e) => { if (hasFiles(e)) { e.preventDefault(); e.currentTarget.classList.remove('file-over'); uploadFiles([...e.dataTransfer.files]); } },
+    },
       titleInput,
       h('div', { class: 'props' },
         h('span', {}, 'Projekt'),
@@ -717,13 +845,24 @@ function taskPanel({ task, comments }, members) {
             },
           }, sections.map((s) => h('option', { value: String(s.id), selected: s.id === task.sectionId }, s.name)))
           : h('span', {}, task.sectionName),
+        h('span', {}, 'Aufwand (Std.)'),
+        h('input', {
+          type: 'number', min: 0, step: 0.5, placeholder: 'z. B. 4', value: task.estimateHours ?? '', title: 'Geschätzter Aufwand, wird für die Auslastung verwendet',
+          onchange: (e) => save({ estimateHours: e.target.value === '' ? null : Number(e.target.value) }),
+        }),
+        fields.map((f) => [h('span', {}, f.name), fieldInput(f)]),
       ),
       h('label', { class: 'field' }, h('span', {}, 'Beschreibung'),
         h('textarea', {
           rows: 6, placeholder: 'Details, Links, Notizen…', value: task.description,
           onchange: (e) => save({ description: e.target.value }),
         })),
-      h('div', { class: 'hint' }, `Erstellt ${creator ? `von ${creator.name} ` : ''}am ${formatDateTime(task.createdAt)}`),
+      h('div', { class: 'panel-section' }, subHead, subWrap, subInput),
+      h('div', { class: 'panel-section' },
+        h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' } },
+          h('h3', { style: { margin: 0 } }, 'Dateien'), uploadBtn, fileInput),
+        attWrap, h('div', { class: 'hint' }, 'Dateien bis 25 MB. Du kannst sie auch einfach hierher ziehen.')),
+      h('div', { class: 'hint', style: { marginTop: '16px' } }, `Erstellt ${creator ? `von ${creator.name} ` : ''}am ${formatDateTime(task.createdAt)}`),
       h('div', { class: 'comments' },
         h('h3', {}, 'Kommentare'),
         commentList,
@@ -842,13 +981,14 @@ function projectDialog(existing) {
   }, extra);
 }
 
-function newTaskDialog(data) {
+function newTaskDialog(data, preset = {}) {
   openDialog('Neue Aufgabe', [
     field('Titel', h('input', { type: 'text', name: 'title', required: true, autofocus: true, maxlength: 300 })),
     field('Spalte', h('select', { name: 'sectionId' }, data.sections.map((s) => h('option', { value: String(s.id) }, s.name)))),
     field('Zuständig', h('select', { name: 'assigneeId' }, h('option', { value: '' }, '– Niemand –'),
       data.members.map((m) => h('option', { value: String(m.id) }, m.name)))),
-    field('Fälligkeitsdatum', h('input', { type: 'date', name: 'dueDate' })),
+    field('Fälligkeitsdatum', h('input', { type: 'date', name: 'dueDate', value: preset.dueDate || '' })),
+    field('Aufwand (Std.)', h('input', { type: 'number', name: 'estimateHours', min: 0, step: 0.5 })),
     field('Priorität', h('select', { name: 'priority' }, Object.entries(PRIO_LABEL).map(([v, l]) => h('option', { value: v }, l)))),
     field('Beschreibung', h('textarea', { name: 'description', rows: 3 })),
   ], 'Aufgabe erstellen', async (fd) => {
@@ -856,6 +996,7 @@ function newTaskDialog(data) {
     body.sectionId = Number(body.sectionId);
     body.assigneeId = body.assigneeId ? Number(body.assigneeId) : null;
     body.dueDate = body.dueDate || null;
+    body.estimateHours = body.estimateHours === '' ? null : Number(body.estimateHours);
     const { task } = await api('POST', `/api/projects/${data.project.id}/tasks`, body);
     state.project.tasks.push(task);
     render();
@@ -921,11 +1062,13 @@ function editUserDialog(u) {
     field('Rolle', h('select', { name: 'role', disabled: self },
       h('option', { value: 'member', selected: u.role === 'member' }, 'Mitglied'),
       h('option', { value: 'admin', selected: u.role === 'admin' }, 'Administrator'))),
+    field('Wochenkapazität (Std.)', h('input', { type: 'number', name: 'weeklyCapacity', min: 0, max: 168, step: 0.5, required: true, value: u.weeklyCapacity }),
+      'Verfügbare Arbeitsstunden pro Woche, Grundlage für die Auslastung.'),
     h('label', { class: 'field', style: { display: 'flex', gap: '8px', alignItems: 'center' } },
       h('input', { type: 'checkbox', name: 'active', checked: u.active, disabled: self, style: { width: 'auto' } }),
       'Konto aktiv (deaktivierte Personen können sich nicht mehr anmelden)'),
   ], 'Speichern', async (fd) => {
-    const body = { name: fd.get('name'), email: fd.get('email') };
+    const body = { name: fd.get('name'), email: fd.get('email'), weeklyCapacity: Number(fd.get('weeklyCapacity')) };
     if (!self) { body.role = fd.get('role'); body.active = fd.get('active') === 'on'; }
     await api('PATCH', `/api/users/${u.id}`, body);
     await Promise.all([refreshUsers(), loadRouteData()]);
@@ -988,6 +1131,383 @@ function settingsView() {
       h('div', { class: 'card-box' }, h('h2', {}, 'Profil'), nameForm),
       h('div', { class: 'card-box' }, h('h2', {}, 'Passwort ändern'), pwForm)),
   ];
+}
+
+// ---------------------------------------------------------------- date helpers
+const pad = (n) => String(n).padStart(2, '0');
+const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+function mondayOf(d) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+  return x;
+}
+function isoWeek(d) {
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  t.setUTCDate(t.getUTCDate() + 4 - (t.getUTCDay() || 7));
+  return Math.ceil(((t - new Date(Date.UTC(t.getUTCFullYear(), 0, 1))) / 864e5 + 1) / 7);
+}
+const parseServerDate = (s) => new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
+const fmtHours = (n) => String(Math.round(n * 10) / 10).replace('.', ',');
+function fmtSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1).replace('.', ',')} MB`;
+}
+
+// ---------------------------------------------------------------- calendar
+function calendarView(tasks, data) {
+  const [y, m] = state.calMonth.split('-').map(Number);
+  const first = new Date(y, m - 1, 1);
+  const last = new Date(y, m, 0);
+  const days = [];
+  for (let d = mondayOf(first); d <= last || d.getDay() !== 1; d = addDays(d, 1)) days.push(d);
+  const byDate = {};
+  for (const t of tasks) if (t.dueDate) (byDate[t.dueDate] ??= []).push(t);
+  const today = todayStr();
+  const shift = (n) => { const d = new Date(y, m - 1 + n, 1); state.calMonth = `${d.getFullYear()}-${pad(d.getMonth() + 1)}`; render(); };
+  const undated = tasks.filter((t) => !t.dueDate && !t.completed).length;
+
+  const cell = (d) => {
+    const key = ymd(d);
+    const el = h('div', { class: `cal-day ${d.getMonth() !== m - 1 ? 'other' : ''} ${key === today ? 'today' : ''}` },
+      h('div', { class: 'cal-num' }, h('span', {}, d.getDate()),
+        data && h('button', { class: 'icon-btn cal-add', title: 'Aufgabe an diesem Tag anlegen', onclick: () => newTaskDialog(data, { dueDate: key }) }, '+')),
+      (byDate[key] || []).map((t) => calChip(t, !data)));
+    el.addEventListener('dragover', (e) => { if (dragTaskId != null) { e.preventDefault(); el.classList.add('drag-over'); } });
+    el.addEventListener('dragleave', (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove('drag-over'); });
+    el.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      el.classList.remove('drag-over');
+      const id = dragTaskId;
+      dragTaskId = null;
+      if (id == null) return;
+      try { applyTaskUpdate((await api('PATCH', `/api/tasks/${id}`, { dueDate: key })).task); } catch (err) { showError(err); }
+    });
+    return el;
+  };
+
+  return h('div', { class: 'calendar' },
+    h('div', { class: 'cal-head' },
+      h('button', { class: 'btn small', title: 'Vorheriger Monat', onclick: () => shift(-1) }, '‹'),
+      h('button', { class: 'btn small', onclick: () => { state.calMonth = todayStr().slice(0, 7); render(); } }, 'Heute'),
+      h('button', { class: 'btn small', title: 'Nächster Monat', onclick: () => shift(1) }, '›'),
+      h('b', { class: 'cal-title' }, first.toLocaleDateString('de-DE', { month: 'long', year: 'numeric' })),
+      h('span', { style: { flex: 1 } }),
+      undated ? h('span', { class: 'hint', style: { margin: 0 } }, `${undated} offene Aufgabe${undated === 1 ? '' : 'n'} ohne Fälligkeitsdatum`) : null),
+    h('div', { class: 'cal-scroll' }, h('div', { class: 'cal-grid' },
+      ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'].map((d) => h('div', { class: 'cal-dow' }, d)), days.map(cell))),
+    h('div', { class: 'hint' }, 'Tipp: Aufgaben lassen sich per Drag & Drop auf einen anderen Tag verschieben.'));
+}
+
+function calChip(t, showProject) {
+  return h('div', {
+    class: `cal-chip ${t.completed ? 'done' : ''}`, draggable: 'true',
+    title: showProject ? `${t.title} (${t.projectName})` : t.title,
+    style: { borderLeftColor: t.projectColor },
+    onclick: () => openTask(t.id),
+    ondragstart: (e) => { dragTaskId = t.id; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(t.id)); },
+    ondragend: () => { dragTaskId = null; document.querySelectorAll('.drag-over').forEach((n) => n.classList.remove('drag-over')); },
+  }, t.title);
+}
+
+function globalCalendarView() {
+  const head = topbar(h('h1', {}, 'Kalender'), h('div', { class: 'spacer' }),
+    h('label', { style: { display: 'inline-flex', gap: '6px', alignItems: 'center', cursor: 'pointer' } },
+      h('input', { type: 'checkbox', checked: state.calMine, onchange: (e) => { state.calMine = e.target.checked; render(); } }),
+      'Nur meine Aufgaben'));
+  if (!state.allTasks) return [head, h('div', { class: 'content loading' }, 'Lädt…')];
+  const tasks = state.calMine ? state.allTasks.filter((t) => t.assigneeId === state.me.id) : state.allTasks;
+  return [head, h('div', { class: 'content' }, calendarView(tasks, null))];
+}
+
+// ---------------------------------------------------------------- resources / workload
+function resourcesView() {
+  const head = topbar(h('h1', {}, 'Auslastung'));
+  if (!state.allTasks) return [head, h('div', { class: 'content loading' }, 'Lädt…')];
+  const open = state.allTasks.filter((t) => !t.completed);
+  const thisMonday = mondayOf(new Date());
+  const weeks = Array.from({ length: 6 }, (_, i) => {
+    const start = addDays(thisMonday, (state.resOffset + i) * 7);
+    const end = addDays(start, 6);
+    const s = ymd(start);
+    const e = ymd(end);
+    return {
+      key: s, week: true, label: `KW ${isoWeek(start)}`, sub: `${start.getDate()}.${start.getMonth() + 1}.–${end.getDate()}.${end.getMonth() + 1}.`,
+      current: s === ymd(thisMonday), test: (t) => !!t.dueDate && t.dueDate >= s && t.dueDate <= e,
+    };
+  });
+  const overdueBefore = ymd(thisMonday);
+  const cols = [
+    { key: 'overdue', label: 'Überfällig', sub: 'vor dieser Woche', test: (t) => !!t.dueDate && t.dueDate < overdueBefore },
+    ...weeks,
+    { key: 'none', label: 'Ohne Datum', sub: '', test: (t) => !t.dueDate },
+  ];
+  const people = [...state.users, null];
+  const tasksFor = (uid, col) => open.filter((t) => (t.assigneeId ?? null) === uid && col.test(t));
+  const sumHours = (list) => list.reduce((s, t) => s + (t.estimateHours || 0), 0);
+
+  const cellFor = (u, col) => {
+    const uid = u ? u.id : null;
+    const list = tasksFor(uid, col);
+    if (!list.length) return h('td', { class: col.current ? 'cur' : '' }, h('span', { class: 'hint' }, '–'));
+    const hours = sumHours(list);
+    const cap = u?.weeklyCapacity || 0;
+    const sel = state.resSel && state.resSel.userId === uid && state.resSel.col === col.key;
+    let level = '';
+    if (col.key === 'overdue') level = 'over';
+    else if (col.week && u && hours) level = cap && hours / cap <= 0.8 ? 'ok' : cap && hours / cap <= 1 ? 'high' : 'over';
+    return h('td', { class: col.current ? 'cur' : '' }, h('button', {
+      class: `res-cell ${level} ${sel ? 'sel' : ''}`, title: 'Aufgaben anzeigen',
+      onclick: () => { state.resSel = sel ? null : { userId: uid, col: col.key }; render(); },
+    },
+    h('span', {}, h('b', {}, list.length), ' Aufg.'),
+    hours ? h('small', {}, col.week && u ? `${fmtHours(hours)} / ${fmtHours(cap)} h` : `${fmtHours(hours)} h`) : h('small', {}, 'kein Aufwand'),
+    col.week && u && hours ? h('div', { class: 'res-bar' }, h('div', { style: { width: `${Math.min(100, cap ? (hours / cap) * 100 : 100)}%` } })) : null));
+  };
+
+  let detail = null;
+  if (state.resSel) {
+    const col = cols.find((c) => c.key === state.resSel.col);
+    const u = state.resSel.userId ? userById(state.resSel.userId) : null;
+    if (col) {
+      const list = tasksFor(state.resSel.userId, col);
+      detail = h('div', { style: { marginTop: '20px' } },
+        h('h2', { style: { fontSize: '15px' } }, `${u ? u.name : 'Nicht zugewiesen'}: ${col.label} ${col.sub ? `(${col.sub})` : ''}`),
+        taskTable(list, { showProject: true }));
+    }
+  }
+
+  return [head, h('div', { class: 'content' },
+    h('div', { class: 'cal-head' },
+      h('button', { class: 'btn small', title: 'Frühere Wochen', onclick: () => { state.resOffset -= 1; state.resSel = null; render(); } }, '‹'),
+      h('button', { class: 'btn small', onclick: () => { state.resOffset = 0; state.resSel = null; render(); } }, 'Aktuelle Woche'),
+      h('button', { class: 'btn small', title: 'Spätere Wochen', onclick: () => { state.resOffset += 1; state.resSel = null; render(); } }, '›'),
+      h('span', { style: { flex: 1 } }),
+      h('span', { class: 'legend' }, h('i', { class: 'ok' }), 'bis 80 %', h('i', { class: 'high' }), 'bis 100 %', h('i', { class: 'over' }), 'überlastet')),
+    h('div', { class: 'res-scroll' }, h('table', { class: 'list-table res-table' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Person'), h('th', {}, 'Offen gesamt'),
+        cols.map((c) => h('th', { class: c.current ? 'cur' : '' }, c.label, h('div', { class: 'th-sub' }, c.sub))))),
+      h('tbody', {}, people.map((u) => {
+        const all = open.filter((t) => (t.assigneeId ?? null) === (u ? u.id : null));
+        if (!u && !all.length) return null;
+        const hrs = sumHours(all);
+        return h('tr', {},
+          h('td', {}, h('div', { class: 'assignee-cell' }, avatar(u), h('div', {}, u ? u.name : 'Nicht zugewiesen',
+            u && h('div', { class: 'hint', style: { margin: 0 } }, `${fmtHours(u.weeklyCapacity)} h pro Woche`)))),
+          h('td', {}, h('b', {}, all.length), hrs ? ` · ${fmtHours(hrs)} h` : ''),
+          cols.map((c) => cellFor(u, c)));
+      })))),
+    h('p', { class: 'hint', style: { fontSize: '13px', maxWidth: '760px' } },
+      'Die Auslastung vergleicht den geschätzten Aufwand der offenen Aufgaben einer Woche mit der Wochenkapazität der Person. ',
+      'Den Aufwand trägst du in der jeweiligen Aufgabe ein, die Kapazität legt ein Admin unter „Team verwalten“ fest. ',
+      state.me.role === 'admin' ? '' : 'Du siehst nur Aufgaben aus Projekten, in denen du Mitglied bist.'),
+    detail)];
+}
+
+// ---------------------------------------------------------------- inbox
+function inboxView() {
+  const list = state.notifications;
+  const head = topbar(h('h1', {}, 'Inbox'), h('div', { class: 'spacer' }),
+    list?.some((n) => !n.read) && h('button', {
+      class: 'btn',
+      onclick: async () => {
+        try { await api('POST', '/api/notifications/read', { all: true }); list.forEach((n) => { n.read = true; }); render(); refreshCounts(); } catch (e) { showError(e); }
+      },
+    }, '✓ Alle als gelesen markieren'));
+  if (!list) return [head, h('div', { class: 'content loading' }, 'Lädt…')];
+  const item = (n) => h('a', {
+    class: `inbox-item ${n.read ? '' : 'unread'}`, href: '#',
+    onclick: async (e) => {
+      e.preventDefault();
+      if (!n.read) { n.read = true; await api('POST', '/api/notifications/read', { id: n.id }).catch(() => {}); refreshCounts(); }
+      go(n.taskId ? `/project/${n.projectId}/board/task/${n.taskId}` : `/project/${n.projectId}`);
+    },
+  },
+  avatar(n.actorId ? { id: n.actorId, name: n.actorName || '?' } : null, 'lg'),
+  h('div', { class: 'inbox-text' },
+    h('div', {}, h('b', {}, n.actorName || 'Jemand'), ' ', n.text),
+    h('div', { class: 'hint' }, formatDateTime(n.createdAt), n.projectName ? [' · ', h('span', { class: 'dot', style: { background: n.projectColor, display: 'inline-block' } }), ' ', n.projectName] : null)),
+  !n.read && h('span', { class: 'unread-dot', title: 'Ungelesen' }));
+  return [head, h('div', { class: 'content' },
+    !list.length
+      ? h('div', { class: 'empty' }, 'Keine Benachrichtigungen. Hier erscheint, wenn dir jemand eine Aufgabe zuweist, kommentiert oder dich zu einem Projekt hinzufügt.')
+      : h('div', { class: 'inbox' }, list.map(item)))];
+}
+
+async function refreshCounts() {
+  if (!state.me || state.me.mustChangePassword) return;
+  try { state.counts = await api('GET', '/api/counts'); updateBadges(); } catch { /* ignore */ }
+}
+function updateBadges() {
+  for (const k of ['inbox', 'chat']) {
+    const el = document.getElementById(`badge-${k}`);
+    if (el) { el.textContent = state.counts[k] || ''; el.hidden = !state.counts[k]; }
+  }
+  const total = state.counts.inbox + state.counts.chat;
+  document.title = total ? `(${total}) Projektmanager` : 'Projektmanager';
+}
+
+// ---------------------------------------------------------------- live events
+let events = null;
+function connectEvents() {
+  events?.close();
+  events = new EventSource('/api/events');
+  events.onopen = refreshCounts;
+  events.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+}
+function disconnectEvents() { events?.close(); events = null; }
+
+async function handleEvent(ev) {
+  if (ev.type === 'notify') {
+    refreshCounts();
+    if (state.route.name === 'inbox') { await loadRouteData(); render(); }
+  } else if (ev.type === 'chat') {
+    const open = state.route.name === 'chat' && state.route.key === ev.channel && chatUI?.listEl?.isConnected;
+    if (open) {
+      appendChatMessage(ev.message);
+      if (ev.message.senderId !== state.me.id) await api('POST', '/api/chat/read', { channel: ev.channel }).catch(() => {});
+    } else if (state.route.name === 'chat') {
+      state.chat.channels = (await api('GET', '/api/chat/channels')).channels;
+      if (chatUI) fillChannels(chatUI.channelsEl);
+    }
+    refreshCounts();
+  }
+}
+
+// ---------------------------------------------------------------- chat
+let chatUI = null;
+
+function channelIcon(c) {
+  if (c.kind === 'dm') return avatar({ id: c.userId, name: c.name });
+  if (c.kind === 'project') return h('span', { class: 'dot', style: { background: c.color } });
+  return h('span', { class: 'chan-hash' }, '#');
+}
+
+function fillChannels(el) {
+  const chans = state.chat.channels || [];
+  const item = (c) => h('a', { class: `chan ${state.route.key === c.key ? 'active' : ''}`, href: `#/chat/${c.key}` },
+    channelIcon(c), h('span', { class: 'label' }, c.name), c.unread ? h('span', { class: 'badge-count' }, c.unread) : null);
+  const group = (label, kind) => {
+    const list = chans.filter((c) => c.kind === kind);
+    return list.length ? [h('div', { class: 'chan-group' }, label), list.map(item)] : null;
+  };
+  el.replaceChildren(h('div', {}, group('Team', 'general'), group('Projekte', 'project'), group('Direktnachrichten', 'dm')));
+}
+
+function appendChatMessage(m) {
+  if (!chatUI?.listEl || chatUI.ids.has(m.id)) return;
+  chatUI.ids.add(m.id);
+  const list = chatUI.listEl;
+  list.querySelector('.chat-empty')?.remove();
+  const d = parseServerDate(m.createdAt);
+  const day = ymd(d);
+  if (day !== chatUI.lastDay) {
+    chatUI.lastDay = day;
+    list.append(h('div', { class: 'chat-day' }, day === todayStr() ? 'Heute' : d.toLocaleDateString('de-DE', { weekday: 'long', day: '2-digit', month: 'long' })));
+  }
+  const sender = m.senderId ? userById(m.senderId) || { id: m.senderId, name: m.senderName || 'Ehemaliges Mitglied' } : null;
+  list.append(h('div', { class: `chat-msg ${m.senderId === state.me.id ? 'mine' : ''}` }, avatar(sender, 'lg'),
+    h('div', { class: 'bubble' },
+      h('div', { class: 'meta' }, h('b', {}, sender?.name || 'Unbekannt'), d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })),
+      h('div', { class: 'text' }, m.body))));
+  list.scrollTop = list.scrollHeight;
+}
+
+function chatView() {
+  const key = state.route.key;
+  const current = (state.chat.channels || []).find((c) => c.key === key);
+  const channelsEl = h('div', { class: 'chat-channels' });
+  chatUI = { channelsEl, listEl: null, ids: new Set(), lastDay: null };
+  fillChannels(channelsEl);
+
+  let conv;
+  if (!current) {
+    conv = h('div', { class: 'chat-conv' }, h('div', { class: 'empty' }, 'Wähle links eine Unterhaltung aus.'));
+  } else {
+    const listEl = h('div', { class: 'chat-messages' });
+    chatUI.listEl = listEl;
+    const msgs = state.chat.messages || [];
+    if (!msgs.length) listEl.append(h('div', { class: 'empty chat-empty' }, 'Noch keine Nachrichten. Schreib die erste!'));
+    msgs.forEach(appendChatMessage);
+    const input = h('textarea', { rows: 2, placeholder: `Nachricht an ${current.kind === 'dm' ? current.name : `#${current.name}`} (Enter zum Senden)` });
+    const send = async () => {
+      const body = input.value.trim();
+      if (!body) return;
+      input.value = '';
+      try { appendChatMessage((await api('POST', '/api/chat/messages', { channel: key, body })).message); } catch (e) { input.value = body; showError(e); }
+    };
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+    const sub = current.kind === 'dm' ? 'Direktnachricht' : current.kind === 'project' ? 'Projekt-Kanal, sichtbar für alle Projektmitglieder' : 'Sichtbar für das gesamte Team';
+    conv = h('div', { class: 'chat-conv' },
+      h('div', { class: 'chat-title' }, h('a', { class: 'btn small chat-back', href: '#/chat' }, '‹'), channelIcon(current),
+        h('div', {}, h('b', {}, current.name), h('div', { class: 'hint', style: { margin: 0 } }, sub))),
+      listEl,
+      h('div', { class: 'chat-form' }, input, h('button', { class: 'btn primary', onclick: send }, 'Senden')));
+    requestAnimationFrame(() => { listEl.scrollTop = listEl.scrollHeight; if (innerWidth > 800) input.focus(); });
+  }
+  return [topbar(h('h1', {}, 'Chat')), h('div', { class: `chat ${current ? 'has-open' : ''}` }, channelsEl, conv)];
+}
+
+// ---------------------------------------------------------------- custom fields dialog
+const FIELD_TYPE_LABEL = { text: 'Text', number: 'Zahl', date: 'Datum', checkbox: 'Checkbox', select: 'Auswahlliste' };
+const splitOptions = (s) => s.split(',').map((o) => o.trim()).filter(Boolean);
+
+function fieldsDialog(data) {
+  const listEl = h('div', { class: 'field-list' });
+  const draw = (fields) => {
+    data.fields = fields;
+    listEl.replaceChildren(...(fields.length ? fields.map(row) : [h('p', { class: 'hint' }, 'Dieses Projekt hat noch keine eigenen Felder.')]));
+  };
+  const call = async (method, url, body) => { try { draw((await api(method, url, body)).fields); return true; } catch (e) { showError(e); draw(data.fields); return false; } };
+  const row = (f) => h('div', { class: 'field-row' },
+    h('input', { type: 'text', value: f.name, maxlength: 60, title: 'Feldname', onchange: (e) => call('PATCH', `/api/fields/${f.id}`, { name: e.target.value }) }),
+    f.type === 'select'
+      ? h('input', { type: 'text', value: f.options.join(', '), title: 'Optionen, durch Komma getrennt', onchange: (e) => call('PATCH', `/api/fields/${f.id}`, { options: splitOptions(e.target.value) }) })
+      : h('span', { class: 'tag' }, FIELD_TYPE_LABEL[f.type]),
+    h('button', {
+      class: 'icon-btn', type: 'button', title: 'Feld löschen',
+      onclick: () => { if (confirm(`Feld „${f.name}“ mit allen eingetragenen Werten löschen?`)) call('DELETE', `/api/fields/${f.id}`); },
+    }, '🗑'));
+
+  const nameIn = h('input', { type: 'text', placeholder: 'Feldname, z. B. Kunde', maxlength: 60 });
+  const optIn = h('input', { type: 'text', placeholder: 'Optionen, durch Komma getrennt', hidden: true });
+  const typeSel = h('select', { onchange: () => { optIn.hidden = typeSel.value !== 'select'; } },
+    Object.entries(FIELD_TYPE_LABEL).map(([v, l]) => h('option', { value: v }, l)));
+  const add = async () => {
+    if (!nameIn.value.trim()) return nameIn.focus();
+    const ok = await call('POST', `/api/projects/${data.project.id}/fields`, { name: nameIn.value, type: typeSel.value, options: splitOptions(optIn.value) });
+    if (ok) { nameIn.value = ''; optIn.value = ''; nameIn.focus(); }
+  };
+  for (const el of [nameIn, optIn]) el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
+
+  draw(data.fields);
+  const dlg = openDialog('Eigene Felder', [
+    h('p', { class: 'hint', style: { fontSize: '13px', marginTop: 0 } }, 'Eigene Felder gelten nur für dieses Projekt und erscheinen optional in jeder Aufgabe sowie als Spalten in der Listen-Ansicht.'),
+    listEl,
+    h('div', { class: 'field-add' }, h('b', {}, 'Neues Feld'), h('div', { class: 'field-row' }, nameIn, typeSel), optIn,
+      h('button', { class: 'btn', type: 'button', onclick: add }, '+ Feld hinzufügen')),
+  ], 'Fertig', async () => {});
+  dlg.addEventListener('close', () => reloadCurrent());
+}
+
+function fieldDisplay(f, v) {
+  if (v == null || v === '') return h('span', { class: 'hint' }, '–');
+  if (f.type === 'checkbox') return '✓';
+  if (f.type === 'date') return new Date(`${v}T00:00:00`).toLocaleDateString('de-DE');
+  if (f.type === 'number') return String(v).replace('.', ',');
+  if (f.type === 'select') return h('span', { class: 'tag' }, v);
+  return v;
+}
+
+async function uploadFile(taskId, file) {
+  const res = await fetch(`/api/tasks/${taskId}/attachments?name=${encodeURIComponent(file.name)}`, {
+    method: 'POST', body: file, credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/octet-stream', 'X-Requested-With': 'projektmanager' },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Upload fehlgeschlagen.');
+  return data;
 }
 
 // ---------------------------------------------------------------- keyboard & boot

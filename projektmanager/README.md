@@ -10,7 +10,14 @@ Selbst gehostetes Projektmanagement-Tool im Stil von Asana. Jede Person in der F
 - **Projekte** mit Farbe, Beschreibung und Mitgliederliste
 - **Board-Ansicht** (Kanban) mit Drag & Drop, eigenen Spalten und Schnellerfassung
 - **Listen-Ansicht** gruppiert nach Spalten
-- **Aufgaben** mit Zuständigkeit, Fälligkeitsdatum, Priorität, Beschreibung und Kommentaren
+- **Aufgaben** mit Zuständigkeit, Fälligkeitsdatum, Priorität, geschätztem Aufwand, Beschreibung und Kommentaren
+- **Unteraufgaben** zum Abhaken in jeder Aufgabe
+- **Dateianhänge** bis 25 MB pro Datei (Upload per Klick oder Drag & Drop, Bildvorschau)
+- **Kalender** pro Projekt und projektübergreifend, Termine per Drag & Drop verschieben
+- **Auslastung (Ressourcen-Management):** offene Aufgaben und geschätzter Aufwand pro Person und Kalenderwoche im Vergleich zur Wochenkapazität
+- **Eigene Felder** pro Projekt (Text, Zahl, Datum, Checkbox, Auswahlliste), sichtbar in der Aufgabe und als Spalten in der Liste
+- **Inbox** mit Benachrichtigungen bei Zuweisung, Kommentaren, erledigten Aufgaben und neuen Projekten
+- **Chat** in Echtzeit: Direktnachrichten, ein Kanal pro Projekt und ein Team-Kanal
 - **Meine Aufgaben:** alle eigenen Aufgaben projektübergreifend, sortiert nach Überfällig, Heute, Nächste 7 Tage usw.
 - Filter nach Person, Hell- und Dunkelmodus, mobil nutzbar
 
@@ -46,5 +53,6 @@ docker run -d -p 3000:3000 -v projektmanager-daten:/data --name projektmanager p
 ## Für den Firmeneinsatz
 
 - **HTTPS:** Betreibe die App hinter einem Reverse Proxy mit TLS (z. B. Caddy oder nginx) und setze `COOKIE_SECURE=true` und `TRUST_PROXY=1`.
-- **Backup:** Alle Daten liegen in `DATA_DIR/projektmanager.db`. Diesen Ordner regelmäßig sichern.
+- **Backup:** Alle Daten liegen in `DATA_DIR` (Datenbank `projektmanager.db` und hochgeladene Dateien im Unterordner `uploads/`). Diesen Ordner regelmäßig sichern.
+- **Reverse Proxy:** Für Datei-Uploads muss der Proxy Anfragen bis 25 MB zulassen (nginx: `client_max_body_size 25m;`). Chat und Inbox nutzen Server-Sent Events unter `/api/events`, dafür darf der Proxy die Antwort nicht puffern und sollte lange Verbindungen erlauben (nginx: `proxy_read_timeout 1h;`).
 - **Sicherheit:** Fehlgeschlagene Logins werden pro IP und E-Mail begrenzt (10 Versuche in 15 Minuten). Bei Passwortänderung oder Deaktivierung werden bestehende Sitzungen beendet.
