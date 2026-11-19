@@ -1,0 +1,15 @@
+{
+  "name": "projektmanager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Selbst gehostetes Projektmanagement-Tool mit Benutzer-Logins",
+  "type": "module",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --watch --disable-warning=ExperimentalWarning server/index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
